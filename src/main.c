@@ -113,9 +113,21 @@ static void init_star_field(struct StarField* field) {
 }
 
 static void init_star(struct StarField* field, size_t star_index) {
-    // x, y are in the range -1 to 1.
-    field->star_x[star_index] = rand_negative_one_to_one() * field->spread;
-    field->star_y[star_index] = rand_negative_one_to_one() * field->spread;
+    float r = rand_zero_to_one();
+
+    if (r > 0.2f) {
+        // x, y are in the range -1 to 1.
+        field->star_x[star_index] = rand_negative_one_to_one() * field->spread;
+        field->star_y[star_index] = rand_negative_one_to_one() * field->spread;
+    } else {
+        static float ratio = 1.0f / (float)0xFFFFFFFF;
+        float zero_to_one = ratio * (float)field->star_colour[star_index];
+        float negative_one_to_one = (2.0f * zero_to_one) - 1.0f;
+
+        field->star_x[star_index] = 1.0f / negative_one_to_one;
+        field->star_y[star_index] = negative_one_to_one;
+    }
+
 
     // z is in the range 0 to 1.
     field->star_z[star_index] = rand_zero_to_one() * field->spread;
@@ -149,19 +161,19 @@ static void draw_star_field(struct Bitmap* target, struct StarField* field, floa
 
         if (z <= 0.0f) {
             init_star(field, i);
-        }
-
-        int32_t screen_x = (int32_t)((x / z) * half_width  + half_width);
-        int32_t screen_y = (int32_t)((y / z) * half_height + half_height);
-
-        if (
-            (screen_x < 0 || screen_x >= WIDTH) ||
-            (screen_y < 0 || screen_y >= HEIGHT)
-        ) {
-            init_star(field, i);
         } else {
-            uint32_t* pixel = ((uint32_t*)target->pixels) + (screen_x + screen_y * WIDTH);
-            *pixel = field->star_colour[i];
+            int32_t screen_x = (int32_t)((x / z) * half_width  + half_width);
+            int32_t screen_y = (int32_t)((y / z) * half_height + half_height);
+
+            if (
+                (screen_x < 0 || screen_x >= WIDTH) ||
+                (screen_y < 0 || screen_y >= HEIGHT)
+            ) {
+                init_star(field, i);
+            } else {
+                uint32_t* pixel = ((uint32_t*)target->pixels) + (screen_x + screen_y * WIDTH);
+                *pixel = field->star_colour[i];
+            }
         }
     }
 }
