@@ -62,13 +62,14 @@ static void init_star(struct StarField* field, size_t star_index, float delta) {
     t += delta / field->phase_speed;
 
     float zero_to_one = ratio * (float)field->star_colour[star_index];
-    float negative_one_to_one = (2.0f * zero_to_one) - 1.0f;
 
     field->star_x[star_index] = cos(t);
-
-    field->star_y[star_index] = field->perspective_on_x && field->perspective_on_y
-        ? negative_one_to_one + sin(t)
-        : negative_one_to_one;
+    field->star_y[star_index] = ((2.0f * zero_to_one) - 1.0f)
+        + (
+            field->perspective_on_x && field->perspective_on_y
+                ? sin(t)
+                : 0.0f
+        );
 
     field->star_z[star_index] = rand_zero_to_one() * field->star_spread;
 }
@@ -101,9 +102,9 @@ static void init_star_field(struct StarField* field) {
             rand_colour()
         );
 
-        __m128i value = _mm_or_ps(colour, mask);
+        __m128i value = _mm_or_si128(colour, mask);
 
-        _mm_storeu_ps((float*)field->star_colour + i, value);
+        _mm_storeu_si128((__m128i*)(field->star_colour + i), value);
     }
 
     for (size_t i = 0; i < star_count; i += 1) {
@@ -123,19 +124,14 @@ static void update_and_render_star_field(struct Bitmap* target, struct StarField
         _mm_set1_ps(field->star_speed)
     );
 
-    __m128 zero4 = _mm_set1_ps(0.0f);
-    __m128 one4  = _mm_set1_ps(1.0f);
-    __m128 half4 = _mm_set1_ps(0.5f);
-
-    __m128 width4  = _mm_set1_ps(target->width);
-    __m128 height4 = _mm_set1_ps(target->height);
-
-    __m128 half_width4  = _mm_mul_ps(width4,  half4);
-    __m128 half_height4 = _mm_mul_ps(height4, half4);
-
-    __m128 bounds = _mm_cvtps_epi32(
-        _mm_mul_ps(width4, height4)
-    );
+    __m128 zero_epi32     = _mm_set1_epi32(0);
+    __m128 half_ps        = _mm_set1_ps(0.5f);
+    __m128 width_epi32    = _mm_set1_epi32(target->width);
+    __m128 height_epi32   = _mm_set1_epi32(target->height);
+    __m128 width_ps       = _mm_set1_ps(target->width);
+    __m128 height_ps      = _mm_set1_ps(target->height);
+    __m128 half_width_ps  = _mm_mul_ps(width_ps,  half_ps);
+    __m128 half_height_ps = _mm_mul_ps(height_ps, half_ps);
 
     for (size_t i = 0; i < field->star_count; i += 4) {
         float* z_addr = field->star_z + i;
@@ -147,41 +143,50 @@ static void update_and_render_star_field(struct Bitmap* target, struct StarField
         z = _mm_sub_ps(z, movement4);
         _mm_storeu_ps(z_addr, z);
 
-        __m128 x_perspective = field->perspective_on_x ? z : one4;
-        __m128 y_perspective = field->perspective_on_y ? z : one4;
-
         __m128i screen_x = _mm_cvtps_epi32(
-            _mm_add_ps(_mm_mul_ps(_mm_div_ps(x, x_perspective), half_width4),  half_width4)
+            _mm_add_ps(
+                _mm_mul_ps(
+                    field->perspective_on_x
+                        ? _mm_div_ps(x, z)
+                        : x,
+                    half_width_ps
+                ),
+                half_width_ps
+            )
         );
 
         __m128i screen_y = _mm_cvtps_epi32(
-            _mm_add_ps(_mm_mul_ps(_mm_div_ps(y, y_perspective), half_height4), half_height4)
+            _mm_add_ps(
+                _mm_mul_ps(
+                    field->perspective_on_y
+                        ? _mm_div_ps(y, z)
+                        : y,
+                    half_height_ps
+                ),
+                half_height_ps
+            )
         );
 
-        __m128 escaped  = zero4;
+        __m128i escaped = zero_epi32;
 
         // screen_x < 0.0f || screen_x >= width
-        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(screen_x, zero4));
-        escaped = _mm_or_ps(escaped, _mm_cmpgt_epi32(screen_x, width4));
-        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(screen_x, width4));
+        escaped = _mm_or_si128(escaped, _mm_cmplt_epi32(screen_x, zero_epi32));
+        escaped = _mm_or_si128(escaped, _mm_cmpgt_epi32(screen_x, width_epi32));
+        escaped = _mm_or_si128(escaped, _mm_cmpeq_epi32(screen_x, width_epi32));
 
         // screen_y < 0.0f || screen_y >= width
-        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(screen_y, zero4));
-        escaped = _mm_or_ps(escaped, _mm_cmpgt_epi32(screen_y, width4));
-        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(screen_y, width4));
+        escaped = _mm_or_si128(escaped, _mm_cmplt_epi32(screen_y, zero_epi32));
+        escaped = _mm_or_si128(escaped, _mm_cmpgt_epi32(screen_y, height_epi32));
+        escaped = _mm_or_si128(escaped, _mm_cmpeq_epi32(screen_y, height_epi32));
 
         // z <= 0.0f
-        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(z, zero4));
-        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(z, zero4));
+        __m128i z_epi32 = _mm_cvtps_epi32(z);
+        escaped = _mm_or_si128(escaped, _mm_cmplt_epi32(z_epi32, zero_epi32));
+        escaped = _mm_or_si128(escaped, _mm_cmpeq_epi32(z_epi32, zero_epi32));
 
         __m128i pixel_addr = _mm_cvtps_epi32(
-            _mm_add_ps(_mm_cvtepi32_ps(screen_x), _mm_mul_ps(_mm_cvtepi32_ps(screen_y), width4))
+            _mm_add_ps(_mm_cvtepi32_ps(screen_x), _mm_mul_ps(_mm_cvtepi32_ps(screen_y), width_ps))
         );
-
-        // pixel_addr < 0.0f || pixel_addr >= (width * height)
-        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(pixel_addr, zero4));
-        escaped = _mm_or_ps(escaped, _mm_cmpgt_epi32(pixel_addr, bounds));
-        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(pixel_addr, bounds));
 
         _mm_storeu_si128((__m128i*)(field->escaped + i), escaped);
         _mm_storeu_si128((__m128i*)(field->pixel_addrs + i), pixel_addr);
