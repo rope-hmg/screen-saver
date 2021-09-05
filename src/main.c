@@ -37,23 +37,26 @@ struct StarField {
     float*    star_x;
     float*    star_y;
     float*    star_z;
+     int32_t* pixel_addrs;
+    uint32_t* escaped;
     uint32_t* star_colour;
 };
 
 static float rand_zero_to_one() {
     float result = (float)rand() / (float)RAND_MAX + 0.000001f;
     SDL_assert(result >= 0.0f && result <= 1.0f);
+
     return(result);
 }
 
 static uint32_t rand_colour() {
     uint32_t value = (uint32_t)((float)0xFFFFFFFF * ((float)rand() / (float)RAND_MAX));
-    uint32_t mask  = 0x000000FF;
-    return(value | mask);
+
+    return(value);
 }
 
 static float ratio = 1.0f / (float)0xFFFFFFFF;
-static float t     = 0.0f;
+static float t     = 1.0f;
 
 static void init_star(struct StarField* field, size_t star_index, float delta) {
     t += delta / field->phase_speed;
@@ -62,9 +65,11 @@ static void init_star(struct StarField* field, size_t star_index, float delta) {
     float negative_one_to_one = (2.0f * zero_to_one) - 1.0f;
 
     field->star_x[star_index] = cos(t);
+
     field->star_y[star_index] = field->perspective_on_x && field->perspective_on_y
         ? negative_one_to_one + sin(t)
         : negative_one_to_one;
+
     field->star_z[star_index] = rand_zero_to_one() * field->star_spread;
 }
 
@@ -72,64 +77,122 @@ static void init_star_field(struct StarField* field) {
     SDL_assert(field->star_count % 4 == 0);
 
     size_t star_count = field->star_count;
-    float* star_pool  = malloc(star_count * sizeof(float) * 3);
+    float* star_pool  = malloc(
+          (star_count * sizeof(float) * 3)
+        + (star_count * sizeof( int32_t))
+        + (star_count * sizeof(uint32_t) * 2)
+    );
 
-    field->star_x = star_pool;
-    field->star_y = star_pool + star_count;
-    field->star_z = star_pool + star_count * 2;
+    field->star_x      = star_pool;
+    field->star_y      = star_pool + star_count;
+    field->star_z      = star_pool + star_count * 2;
 
-    field->star_colour = malloc(star_count * sizeof(uint32_t));
+    field->pixel_addrs = ( int32_t*)(star_pool + star_count * 3);
+    field->escaped     = (uint32_t*)(star_pool + star_count * 4);
+    field->star_colour = (uint32_t*)(star_pool + star_count * 5);
+
+    __m128i mask = _mm_set1_epi32(0x000000FF);
+
+    for (size_t i = 0; i < star_count; i += 4) {
+        __m128i colour = _mm_set_epi32(
+            rand_colour(),
+            rand_colour(),
+            rand_colour(),
+            rand_colour()
+        );
+
+        __m128i value = _mm_or_ps(colour, mask);
+
+        _mm_storeu_ps((float*)field->star_colour + i, value);
+    }
 
     for (size_t i = 0; i < star_count; i += 1) {
-        field->star_colour[i] = rand_colour();
         init_star(field, i, 0.0f);
     }
 }
 
-static void update_and_render_star_field(struct Bitmap* target, struct StarField* field, float delta) {
-    bitmap_clear(target);
+static void deinit_star_field(struct StarField* field) {
+    // Star X points to the beginning of the chunk of memory that
+    // was allocated for the star data.
+    free(field->star_x);
+}
 
-    __m128 delta4 = _mm_set_ps1(delta);
-    __m128 speed4 = _mm_set_ps1(field->star_speed);
+static void update_and_render_star_field(struct Bitmap* target, struct StarField* field, float delta) {
+    __m128 movement4 = _mm_mul_ps(
+        _mm_set1_ps(delta),
+        _mm_set1_ps(field->star_speed)
+    );
+
+    __m128 zero4 = _mm_set1_ps(0.0f);
+    __m128 one4  = _mm_set1_ps(1.0f);
+    __m128 half4 = _mm_set1_ps(0.5f);
+
+    __m128 width4  = _mm_set1_ps(target->width);
+    __m128 height4 = _mm_set1_ps(target->height);
+
+    __m128 half_width4  = _mm_mul_ps(width4,  half4);
+    __m128 half_height4 = _mm_mul_ps(height4, half4);
+
+    __m128 bounds = _mm_cvtps_epi32(
+        _mm_mul_ps(width4, height4)
+    );
 
     for (size_t i = 0; i < field->star_count; i += 4) {
-        float* addr = field->star_z + i;
+        float* z_addr = field->star_z + i;
 
-        _mm_store_ps(
-            addr,
-            _mm_sub_ps(
-                _mm_load_ps(addr),
-                _mm_mul_ps(delta4, speed4)
-            )
+        __m128 x = _mm_loadu_ps(field->star_x + i);
+        __m128 y = _mm_loadu_ps(field->star_y + i);
+        __m128 z = _mm_loadu_ps(z_addr);
+
+        z = _mm_sub_ps(z, movement4);
+        _mm_storeu_ps(z_addr, z);
+
+        __m128 x_perspective = field->perspective_on_x ? z : one4;
+        __m128 y_perspective = field->perspective_on_y ? z : one4;
+
+        __m128i screen_x = _mm_cvtps_epi32(
+            _mm_add_ps(_mm_mul_ps(_mm_div_ps(x, x_perspective), half_width4),  half_width4)
         );
+
+        __m128i screen_y = _mm_cvtps_epi32(
+            _mm_add_ps(_mm_mul_ps(_mm_div_ps(y, y_perspective), half_height4), half_height4)
+        );
+
+        __m128 escaped  = zero4;
+
+        // screen_x < 0.0f || screen_x >= width
+        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(screen_x, zero4));
+        escaped = _mm_or_ps(escaped, _mm_cmpgt_epi32(screen_x, width4));
+        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(screen_x, width4));
+
+        // screen_y < 0.0f || screen_y >= width
+        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(screen_y, zero4));
+        escaped = _mm_or_ps(escaped, _mm_cmpgt_epi32(screen_y, width4));
+        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(screen_y, width4));
+
+        // z <= 0.0f
+        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(z, zero4));
+        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(z, zero4));
+
+        __m128i pixel_addr = _mm_cvtps_epi32(
+            _mm_add_ps(_mm_cvtepi32_ps(screen_x), _mm_mul_ps(_mm_cvtepi32_ps(screen_y), width4))
+        );
+
+        // pixel_addr < 0.0f || pixel_addr >= (width * height)
+        escaped = _mm_or_ps(escaped, _mm_cmplt_epi32(pixel_addr, zero4));
+        escaped = _mm_or_ps(escaped, _mm_cmpgt_epi32(pixel_addr, bounds));
+        escaped = _mm_or_ps(escaped, _mm_cmpeq_epi32(pixel_addr, bounds));
+
+        _mm_storeu_si128((__m128i*)(field->escaped + i), escaped);
+        _mm_storeu_si128((__m128i*)(field->pixel_addrs + i), pixel_addr);
     }
 
-    float half_width  = target->width  * 0.5f;
-    float half_height = target->height * 0.5f;
-
     for (size_t i = 0; i < field->star_count; i += 1) {
-        float x = field->star_x[i];
-        float y = field->star_y[i];
-        float z = field->star_z[i];
-
-        if (z <= 0.0f) {
+        if (field->escaped[i]) {
             init_star(field, i, delta);
         } else {
-            float x_perspective = field->perspective_on_x ? z : 1.0f;
-            float y_perspective = field->perspective_on_y ? z : 1.0f;
-
-            int32_t screen_x = (int32_t)((x / x_perspective) * half_width  + half_width);
-            int32_t screen_y = (int32_t)((y / y_perspective) * half_height + half_height);
-
-            if (
-                (screen_x < 0 || screen_x >= target->width) ||
-                (screen_y < 0 || screen_y >= target->height)
-            ) {
-                init_star(field, i, delta);
-            } else {
-                uint32_t* pixel = ((uint32_t*)target->pixels) + (screen_x + screen_y * target->width);
-                *pixel = field->star_colour[i];
-            }
+            uint32_t* pixel = ((uint32_t*)target->pixels) + field->pixel_addrs[i];
+            *pixel = field->star_colour[i];
         }
     }
 }
@@ -214,12 +277,16 @@ int main(void) {
                 }
 
                 SDL_LockTexture(buffer, NULL, (void**)&target.pixels, &target.pitch);
+                bitmap_clear(&target);
                 update_and_render_star_field(&target, &star_field, delta);
                 SDL_UnlockTexture(buffer);
 
                 SDL_RenderCopy(renderer, buffer, NULL, NULL);
                 SDL_RenderPresent(renderer);
             }
+
+            deinit_star_field(&star_field);
+            SDL_DestroyTexture(buffer);
         }
     }
 
